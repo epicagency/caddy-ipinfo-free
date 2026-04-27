@@ -1,4 +1,4 @@
-module github.com/oltdaniel/caddy-ipinfo-free
+module github.com/epicagency/caddy-ipinfo-free
 
 go 1.25
 
