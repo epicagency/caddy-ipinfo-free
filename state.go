@@ -45,10 +45,12 @@ type IPInfoFreeState struct {
 	Path             string `json:"path,omitempty"`
 	ErrorOnInvalidIP bool   `json:"error_on_invalid_ip,omitempty"`
 
-	logger    *zap.Logger       `json:"-"`
-	ctx       caddy.Context     `json:"-"`
-	scheduler gocron.Scheduler  `json:"-"`
-	db        *maxminddb.Reader `json:"-"`
+	logger       *zap.Logger       `json:"-"`
+	ctx          caddy.Context     `json:"-"`
+	scheduler    gocron.Scheduler  `json:"-"`
+	db           *maxminddb.Reader `json:"-"`
+	etag         string            `json:"-"`
+	lastModified string            `json:"-"`
 }
 
 // CaddyModule returns the Caddy module information
@@ -123,52 +125,26 @@ func parseCaddyfileConfig(d *caddyfile.Dispenser, _ any) (any, error) {
 }
 
 func validateIPInfoFreeUrl(givenUrl string) (*url.URL, error) {
-	// Example or expected data url:
-	// https://ipinfo.io/data/free/asn.mmdb?token=magicduck
-	// New Lite Database Format:
-	// https://ipinfo.io/data/ipinfo_lite.mmdb?token=magicduck
-
+	if givenUrl == "" {
+		return nil, errors.New("ipinfo_free_config: url is required")
+	}
 	u, err := url.Parse(givenUrl)
 	if err != nil {
-		return u, err
+		return nil, err
 	}
-
-	if u.Scheme != "https" {
-		return u, errors.New("expected a https url")
+	if u.Scheme == "" || u.Host == "" {
+		return u, errors.New("ipinfo_free_config: url must be absolute (scheme + host)")
 	}
-
-	if u.Hostname() != "ipinfo.io" {
-		return u, errors.New("invalid ipinfo url hostname. expected ipinfo.io")
-	}
-
-	switch u.Path {
-	case "/data/free/asn.mmdb", "/data/free/country.mmdb", "/data/free/country_asn.mmdb":
-	case "/data/ipinfo_lite.mmdb":
-	default:
-		return u, errors.New("invalid ipinfo free dataset path")
-	}
-
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil {
-		return u, err
-	}
-
-	if _, ok := q["token"]; !ok {
-		return u, errors.New("expected a access token in the ipinfo url")
-	}
-
 	return u, nil
 }
 
 func (m *IPInfoFreeState) Validate() error {
-	// Verify given ipinfo url
-	if parsedUrl, err := validateIPInfoFreeUrl(m.Url); err != nil {
+	parsedUrl, err := validateIPInfoFreeUrl(m.Url)
+	if err != nil {
 		return err
-	} else {
-		m.logger.Info("ipinfo configured to use", zap.String("database_type", path.Base(parsedUrl.Path)))
 	}
+	m.logger.Info("ipinfo configured to use", zap.String("url", parsedUrl.String()))
 
-	// Verify crontab
 	if _, err := cron.ParseStandard(m.Cron); err != nil {
 		return err
 	}
@@ -176,171 +152,159 @@ func (m *IPInfoFreeState) Validate() error {
 	return nil
 }
 
-// Structure to unmarshal response from https://ipinfo.io/data/free/country.mmdb/checksums?token=magicduck
-type IPInfoFreeChecksumResponse struct {
-	Checksums struct {
-		MD5    string `json:"md5"`
-		SHA1   string `json:"sha1"`
-		SHA256 string `json:"sha256"`
-	} `json:"checksums"`
-}
-
-func (m *IPInfoFreeState) getLatestDatabaseChecksums() (*IPInfoFreeChecksumResponse, error) {
-	// Example: https://ipinfo.io/data/free/country.mmdb/checksums?token=magicduck
-
-	// Parse data url to extract necessary parameters
-	u, err := url.Parse(m.Url)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse query from data url
-	q, err := url.ParseQuery(u.RawQuery)
-	if err != nil {
-		return nil, err
-	}
-
-	// Extract token query parameters
-	token, ok := q["token"]
-	if !ok {
-		return nil, errors.New("expected a access token in the ipinfo url")
-	}
-
-	// Build new URL for checksum endpoint
-	url := fmt.Sprintf("https://ipinfo.io/%s/checksums?token=%s", u.Path, token[0])
-
-	// Request checksum endpoint
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-
-	// Parse JSON response
-	var checksums IPInfoFreeChecksumResponse
-
-	decoder := json.NewDecoder(resp.Body)
-	err = decoder.Decode(&checksums)
-	if err != nil {
-		return nil, err
-	}
-
-	m.logger.Debug("current ipinfo checksums", zap.String("database_type", path.Base(u.Path)), zap.String("checksum_sha256", checksums.Checksums.SHA256))
-
-	// Return latest checksums
-	return &checksums, nil
-}
-
 func (m *IPInfoFreeState) getFilepath() string {
 	u, err := url.Parse(m.Url)
 	if err != nil {
-		return path.Join(u.Path, "unknown.mmdb")
+		return path.Join(m.Path, "database.mmdb")
 	}
-	return path.Join(m.Path, path.Base(u.Path))
+	name := path.Base(u.Path)
+	if name == "." || name == "/" || name == "" {
+		name = "database.mmdb"
+	}
+	return path.Join(m.Path, name)
 }
 
-func (m *IPInfoFreeState) checkIfUpdateIsNecessary() (bool, *IPInfoFreeChecksumResponse, error) {
-	// Request latest checksums published by ipinfo
-	checksums, err := m.getLatestDatabaseChecksums()
+type databaseMeta struct {
+	ETag         string `json:"etag,omitempty"`
+	LastModified string `json:"last_modified,omitempty"`
+}
+
+func (m *IPInfoFreeState) metaFilepath() string {
+	return m.getFilepath() + ".meta"
+}
+
+func (m *IPInfoFreeState) loadMeta() {
+	data, err := os.ReadFile(m.metaFilepath())
 	if err != nil {
-		return false, checksums, err
+		return
+	}
+	var meta databaseMeta
+	if err := json.Unmarshal(data, &meta); err != nil {
+		m.logger.Warn("could not parse database meta sidecar", zap.Error(err))
+		return
+	}
+	m.etag = meta.ETag
+	m.lastModified = meta.LastModified
+}
+
+func (m *IPInfoFreeState) saveMeta(etag, lastModified string) {
+	data, err := json.Marshal(databaseMeta{ETag: etag, LastModified: lastModified})
+	if err != nil {
+		m.logger.Warn("could not encode database meta sidecar", zap.Error(err))
+		return
+	}
+	if err := os.WriteFile(m.metaFilepath(), data, 0644); err != nil {
+		m.logger.Warn("could not write database meta sidecar", zap.Error(err))
+	}
+}
+
+func (m *IPInfoFreeState) checkIfUpdateIsNecessary() (necessary bool, newETag, newLastModified string, err error) {
+	if _, statErr := os.Stat(m.getFilepath()); statErr != nil {
+		return true, "", "", nil
 	}
 
-	// If file does not exist yet, update is necessary independent of checksums
-	if _, err := os.Stat(m.getFilepath()); err != nil {
-		return true, checksums, nil
+	req, err := http.NewRequestWithContext(m.ctx, http.MethodHead, m.Url, nil)
+	if err != nil {
+		return false, "", "", err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return false, "", "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		m.logger.Debug("HEAD did not return 200, treating as update-needed",
+			zap.Int("status", resp.StatusCode))
+		return true, "", "", nil
 	}
 
-	// Generate checksum of currently stored database
-	currentChecksum, err := generateSha256ForFile(m.getFilepath())
+	newETag = resp.Header.Get("ETag")
+	newLastModified = resp.Header.Get("Last-Modified")
 
-	// Compare checksums, if different, update is necessary
-	if checksums.Checksums.SHA256 != currentChecksum {
-		return true, checksums, err
+	if newETag == "" && newLastModified == "" {
+		return true, "", "", nil
 	}
 
-	// There is no other case that is possible which would require an database update
-	return false, checksums, nil
+	if newETag != "" && newETag == m.etag {
+		return false, newETag, newLastModified, nil
+	}
+	if newLastModified != "" && newLastModified == m.lastModified {
+		return false, newETag, newLastModified, nil
+	}
+	return true, newETag, newLastModified, nil
 }
 
 func (m *IPInfoFreeState) runUpdate() error {
-	// Check if import is necessary (if db nil and database file exists)
+	// Lazy-load existing on-disk db on first run
 	if _, err := os.Stat(m.getFilepath()); m.db == nil && err == nil {
-		// Open file and overwrite current instance if loaded ok
-		// NOTE: No closing of old database necessary, as it is nil
 		if newDb, err := maxminddb.Open(m.getFilepath()); err == nil {
 			m.db = newDb
 		}
 	}
 
-	// Check if downloading an update of the database is necessary
-	isNecessary, newChecksums, err := m.checkIfUpdateIsNecessary()
+	necessary, newETag, newLastModified, err := m.checkIfUpdateIsNecessary()
+	if err != nil {
+		return err
+	}
+	if !necessary {
+		return nil
+	}
+
+	m.logger.Debug("downloading database", zap.String("url", m.Url))
+
+	req, err := http.NewRequestWithContext(m.ctx, http.MethodGet, m.Url, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to fetch database: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("unexpected status code from database url: %d", resp.StatusCode)
+	}
+
+	databaseFilepath := m.getFilepath()
+	os.Rename(databaseFilepath, databaseFilepath+".old")
+
+	f, err := os.Create(databaseFilepath)
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(f, resp.Body); err != nil {
+		f.Close()
+		return err
+	}
+	f.Close()
+
+	newDb, err := maxminddb.Open(databaseFilepath)
 	if err != nil {
 		return err
 	}
 
-	if isNecessary {
-		m.logger.Debug("new database available, starting download")
-
-		// Request database
-		resp, err := http.Get(m.Url)
-		if err != nil {
-			return errors.New("failed to connect to ipinfo")
-		}
-
-		// check response code
-		switch resp.StatusCode {
-		case http.StatusTooManyRequests:
-			return errors.New("too many requests for database download (limit: 10 per day per ip)")
-		case http.StatusOK:
-			break
-		default:
-			return errors.New("unexpected response from ipinfo")
-		}
-
-		// Rename current database
-		databaseFilepath := m.getFilepath()
-		os.Rename(databaseFilepath, databaseFilepath+".old")
-
-		// Store new downloaded database
-		f, err := os.Create(databaseFilepath)
-		if err != nil {
-			return err
-		}
-		defer f.Close()
-
-		// Write response to file
-		if _, err := io.Copy(f, resp.Body); err != nil {
-			return err
-		}
-
-		// Verify checksum
-		currentChecksum, err := generateSha256ForFile(databaseFilepath)
-		if err != nil {
-			return err
-		}
-		if currentChecksum != newChecksums.Checksums.SHA256 {
-			return errors.New("newly downloaded database has checksum mismatch")
-		}
-
-		// Create new reader for new database file
-		newDb, err := maxminddb.Open(databaseFilepath)
-		if err != nil {
-			return err
-		}
-
-		// Replace database instance with new one and close old one correctly
-		oldDb := m.db
-		m.db = newDb
-		if oldDb != nil {
-			oldDb.Close()
-		}
-
-		// Clean-up by deleting old database
-		os.Remove(databaseFilepath + ".old")
-
-		m.logger.Info("new database downloaded from ipinfo", zap.String("filepath", databaseFilepath), zap.String("checksum", currentChecksum))
+	oldDb := m.db
+	m.db = newDb
+	if oldDb != nil {
+		oldDb.Close()
 	}
 
+	// GET response validators take precedence if present
+	if v := resp.Header.Get("ETag"); v != "" {
+		newETag = v
+	}
+	if v := resp.Header.Get("Last-Modified"); v != "" {
+		newLastModified = v
+	}
+	m.etag = newETag
+	m.lastModified = newLastModified
+	m.saveMeta(newETag, newLastModified)
+
+	os.Remove(databaseFilepath + ".old")
+
+	m.logger.Info("database updated", zap.String("filepath", databaseFilepath))
 	return nil
 }
 
@@ -387,6 +351,8 @@ func (m *IPInfoFreeState) Provision(ctx caddy.Context) error {
 	if err := os.MkdirAll(m.Path, os.FileMode(0744)); err != nil {
 		return err
 	}
+	// Load any persisted HEAD validators from a previous run
+	m.loadMeta()
 
 	return nil
 }

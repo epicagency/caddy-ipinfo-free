@@ -1,31 +1,12 @@
 package caddyipinfofree
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"io"
 	"log/slog"
-	"os"
 
 	"github.com/go-co-op/gocron/v2"
 	"go.uber.org/zap"
 	"go.uber.org/zap/exp/zapslog"
 )
-
-func generateSha256ForFile(filepath string) (string, error) {
-	f, err := os.Open(filepath)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
-	currentChecksum := sha256.New()
-	if _, err := io.Copy(currentChecksum, f); err != nil {
-		return "", err
-	}
-
-	return hex.EncodeToString(currentChecksum.Sum(nil)), nil
-}
 
 func errorToLogsWrapper(l *zap.Logger, f func() error) func() {
 	return func() {

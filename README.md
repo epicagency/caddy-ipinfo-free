@@ -30,7 +30,7 @@ Easy country and ASN lookup by IP with the free IPInfo database.
     order ipinfo_free first
     # Configure module
     ipinfo_free_config {
-        url https://ipinfo.io/data/ipinfo_lite.mmdb?token=magicduck
+        url https://your.host.example/path/to/db.mmdb
         cron "10 16 * * *"
         path /tmp/caddy_ipinfo
     }
@@ -61,7 +61,7 @@ ASN: AS13335 Cloudflare, Inc. cloudflare.com
 
 ## Why?
 
-IPInfo distributes their country and ASN databases for free every 24h with full accuracy. With this module and a few lines of config in your `Caddyfile`, you can query the database anywhere with anything.
+IPInfo distributes their country and ASN databases for free every 24h with full accuracy. With this module and a few lines of config in your `Caddyfile`, you can query an MMDB database — IPInfo's directly, a self-hosted mirror, or any other compatible source — from anywhere in your Caddy config.
 
 ## Installation
 
@@ -94,10 +94,10 @@ CADDY_VERSION=latest xcaddy build --with github.com/oltdaniel/caddy-ipinfo-free
 
 #### Examples
 ```caddyfile
-ipinfo_free_config https://ipinfo.io/data/ipinfo_lite.mmdb?token=magicduck
+ipinfo_free_config https://your.host.example/path/to/db.mmdb
 
 ipinfo_free_config {
-    url https://ipinfo.io/data/ipinfo_lite.mmdb?token=magicduck
+    url https://your.host.example/path/to/db.mmdb
     cron "10 16 * * *"
     path /tmp/caddy_ipinfo
     error_on_invalid_ip true
@@ -108,7 +108,7 @@ ipinfo_free_config {
 
 | Name | Values | Description |
 |-|-|-|
-| `url` | valid ipinfo free database url | This url can be easily found in the [Dashboard](https://ipinfo.io/dashboard/downloads) of IPInfo after creating an account. Simply choose a database of your choice in the MMDB format and paste the url here. If you only choose the Country or ASN Database, only these values can be extracted and filled into the variables. The other values will simply be empty. If the Database with both types is chosen, all details will be available. |
+| `url` | any absolute http(s) url to an MMDB file | The module fetches the MMDB at this URL on the configured cron schedule. There is no hostname, scheme, path, or token restriction — point it at your private mirror, an IPInfo download URL with a token, or any other origin. The module uses an HTTP `HEAD` request and compares the `ETag` / `Last-Modified` response headers against values stored in a sidecar `<dbfile>.meta` file to skip downloads when the database is unchanged. If your origin returns neither header, the database will be re-downloaded on every cron tick. |
 | `cron` | valid crontab notation<br><br>Default: `10 16 * * *` | Customize how often you want to check for a new database. The official time is published by IPInfo in their FAQ [here](https://ipinfo.io/faq/article/141-when-do-the-updates-happen). Timezone is UTC. |
 | `path` | valid path to store the database<br><br>Default: [`os.TempDir()`](https://pkg.go.dev/os#TempDir) with directory `caddy_ipinfo_free` | This will be the path where the databases are stored after download. As there are different kinds of databases, we only accept a path and not a specific filename. Each database will be stored here by their corresponding names from the configured url.<br><br>If the configured path does not exist, the directories will be created. If not path is given, a temporary directory will be created in the systems temporary directory with the name `caddy_ipinfo_free`. |
 | `error_on_invalid_ip` | accepted input for [`strconv.ParseBool`](https://pkg.go.dev/strconv#ParseBool) <br><br>Default: `false` | Allows enabling error logs when an invalid ip is given to the handler. If you debug something enabling this is recommended. The Variable `ipinfo_free.error` will be set regardless. The main use-case for this feature is to avoid overloading the logs in production when presented with invalid IPs by the client. **NOTE**: Previously known as `quiet_on_invalid_ip`, which made it more difficult to properly handle the default true state. |
@@ -237,12 +237,14 @@ Do you have a neat way of using this library in your Caddyfile? Feel free to sub
 
 ## Internals
 
-This module will automatically update the database from ipinfo and store it in the configured path. You can freely configure the `cron` option to update the database in a timely manner of your choosing. However, the most frequent update rate that should be used is hourly as the database will only be updated by IPInfo every 24 hours.
+This module automatically updates the database from the configured URL and stores it in the configured path. On every cron tick it issues an HTTP `HEAD` request and compares the `ETag` / `Last-Modified` response headers against the values stored in a sidecar `<dbfile>.meta` file from the previous successful download — if either matches, the download is skipped. If your origin returns neither validator header, the database will be re-downloaded on every cron tick.
+
+You can freely configure the `cron` option. If you pull directly from IPInfo, note that their database is only refreshed every 24 hours and download rate limits apply — see the resources below.
 
 ### Resources
 
-- [IPInfo Database Download rate limits](https://community.ipinfo.io/t/announcement-we-are-adding-rate-limits-to-data-downloads/358)
-- [IPInfo Update Schedule](https://ipinfo.io/faq/article/141-when-do-the-updates-happen)
+- [IPInfo Database Download rate limits](https://community.ipinfo.io/t/announcement-we-are-adding-rate-limits-to-data-downloads/358) (only relevant when pulling directly from IPInfo)
+- [IPInfo Update Schedule](https://ipinfo.io/faq/article/141-when-do-the-updates-happen) (only relevant when pulling directly from IPInfo)
 - [Caddy order option](https://caddyserver.com/docs/caddyfile/options#order)
 
 ## Development
